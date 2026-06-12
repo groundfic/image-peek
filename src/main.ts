@@ -4,6 +4,7 @@ import {
 	Platform,
 	Plugin,
 	PluginSettingTab,
+	Scope,
 	Setting,
 	setIcon,
 } from "obsidian";
@@ -159,22 +160,9 @@ export default class QuickPeekPlugin extends Plugin {
 	};
 
 	private onKeyDown = (evt: KeyboardEvent) => {
-		// 覆層開啟中：Space / Esc 關閉，← → 導覽
+		// 覆層開啟中：按鍵全部由覆層的 Scope 處理（見 PeekOverlay 建構子），
+		// 這裡只負責不要讓「Space 開啟預覽」的邏輯重複觸發
 		if (this.overlay) {
-			if (
-				evt.code === "Space" ||
-				evt.key === "Escape" ||
-				evt.key === "ArrowLeft" ||
-				evt.key === "ArrowRight"
-			) {
-				evt.preventDefault();
-				evt.stopPropagation();
-				if (evt.code === "Space" || evt.key === "Escape") {
-					this.overlay.close();
-				} else {
-					this.overlay.navigate(evt.key === "ArrowRight" ? 1 : -1);
-				}
-			}
 			return;
 		}
 
@@ -354,11 +342,38 @@ class PeekOverlay {
 	private tapMoved = false;
 	private lastStageTap = 0;
 
+	private keyScope: Scope;
+
 	constructor(
 		private plugin: QuickPeekPlugin,
 		private list: HTMLImageElement[],
 		private index: number
 	) {
+		// 推入自己的按鍵作用域：預覽開啟期間，方向鍵／Space／Esc 由覆層獨佔，
+		// Canvas 的「方向鍵移動節點」等快捷鍵不會再收到事件（與 Modal 同機制）
+		this.keyScope = new Scope();
+		this.keyScope.register([], "ArrowLeft", (evt) => {
+			evt.preventDefault();
+			this.navigate(-1);
+			return false;
+		});
+		this.keyScope.register([], "ArrowRight", (evt) => {
+			evt.preventDefault();
+			this.navigate(1);
+			return false;
+		});
+		this.keyScope.register([], "Escape", (evt) => {
+			evt.preventDefault();
+			this.close();
+			return false;
+		});
+		this.keyScope.register([], " ", (evt) => {
+			evt.preventDefault();
+			this.close();
+			return false;
+		});
+		plugin.app.keymap.pushScope(this.keyScope);
+
 		const doc = document.body;
 
 		this.rootEl = doc.createDiv({ cls: "image-peek-overlay" });
@@ -644,6 +659,7 @@ class PeekOverlay {
 	}
 
 	destroy() {
+		this.plugin.app.keymap.popScope(this.keyScope);
 		this.rootEl.remove();
 		this.onClosed?.();
 	}
