@@ -1,9 +1,11 @@
 import {
 	App,
+	FileSystemAdapter,
 	Notice,
 	Platform,
 	Plugin,
 	PluginSettingTab,
+	requestUrl,
 	Scope,
 	Setting,
 	setIcon,
@@ -33,6 +35,34 @@ interface ResolvedImage {
 }
 
 /** 圖片允許出現的容器（筆記閱讀模式、Live Preview、Canvas、hover 預覽） */
+/** Obsidian 桌面版存在但未列入公開型別的 API（見 README "internal APIs" 段落） */
+interface AppWithDesktopInternals extends App {
+	openWithDefaultApp?: (path: string) => void;
+	showInFolder?: (path: string) => void;
+}
+
+type ShareMenuInstance = {
+	popup: (opts: { window: unknown; x: number; y: number }) => void;
+};
+type ShareMenuCtor = new (opts: { filePaths: string[] }) => ShareMenuInstance;
+interface ElectronRemoteLike {
+	ShareMenu?: ShareMenuCtor;
+	getCurrentWindow: () => unknown;
+	require?: (module: string) => { ShareMenu?: ShareMenuCtor } | undefined;
+}
+
+/** 取回圖片資料：http(s) 走 requestUrl（避開 CORS）；
+ *  app:// 等本地協定 requestUrl 接不到，維持 fetch */
+async function fetchImageBlob(src: string): Promise<Blob> {
+	if (src.startsWith("http")) {
+		const res = await requestUrl({ url: src });
+		const type = res.headers["content-type"]?.split(";")[0] ?? "image/png";
+		return new Blob([res.arrayBuffer], { type });
+	}
+	const resp = await fetch(src); // app:// 本地資源僅 fetch 可達
+	return resp.blob();
+}
+
 const CONTAINER_SELECTOR =
 	".markdown-reading-view, .markdown-source-view, .canvas-wrapper, .popover.hover-popover";
 
@@ -53,17 +83,17 @@ export default class QuickPeekPlugin extends Plugin {
 		this.addSettingTab(new QuickPeekSettingTab(this.app, this));
 
 		// 追蹤目前懸停的圖片（給 Space 觸發用）
-		this.registerDomEvent(document, "mouseover", (evt) => {
+		this.registerDomEvent(activeDocument, "mouseover", (evt) => {
 			const img = this.previewableImg(evt.target);
 			if (img) this.hoveredImg = img;
 		});
-		this.registerDomEvent(document, "mouseout", (evt) => {
+		this.registerDomEvent(activeDocument, "mouseout", (evt) => {
 			if (evt.target === this.hoveredImg) this.hoveredImg = null;
 		});
 
 		// 記錄按下位置，用來區分「點」與「拖曳」
 		this.registerDomEvent(
-			document,
+			activeDocument,
 			"pointerdown",
 			(evt) => {
 				this.downPos = { x: evt.clientX, y: evt.clientY };
@@ -73,11 +103,11 @@ export default class QuickPeekPlugin extends Plugin {
 		);
 
 		// 桌面：雙擊開啟
-		this.registerDomEvent(document, "dblclick", this.onDblClick, {
+		this.registerDomEvent(activeDocument, "dblclick", this.onDblClick, {
 			capture: true,
 		});
 		// 觸控：雙點開啟（行動版的 dblclick 不可靠，自己偵測）
-		this.registerDomEvent(document, "pointerup", this.onPointerUp, {
+		this.registerDomEvent(activeDocument, "pointerup", this.onPointerUp, {
 			capture: true,
 		});
 
@@ -180,16 +210,19 @@ export default class QuickPeekPlugin extends Plugin {
 	};
 
 	private isEditingContext(): boolean {
-		const el = document.activeElement as HTMLElement | null;
+		const el = activeDocument.activeElement;
 		if (!el) return false;
-		if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement)
+		if (el.instanceOf(HTMLInputElement) || el.instanceOf(HTMLTextAreaElement))
 			return true;
-		return el.isContentEditable || !!el.closest(".cm-editor");
+		return (
+			(el.instanceOf(HTMLElement) && el.isContentEditable) ||
+			!!el.closest(".cm-editor")
+		);
 	}
 
 	/** Canvas 中被選取（focused）的圖片節點，模仿無邊記「選取後按 Space」 */
 	private focusedCanvasImg(): HTMLImageElement | null {
-		const img = document.querySelector<HTMLImageElement>(
+		const img = activeDocument.querySelector<HTMLImageElement>(
 			".canvas-node.is-focused .canvas-node-content img"
 		);
 		// 一樣要通過完整檢查（排除選擇器、vault 圖檔限制），
@@ -228,10 +261,10 @@ export default class QuickPeekPlugin extends Plugin {
 		this.overlay?.destroy();
 
 		// 收集同一個視圖內的所有圖片，給 ← → 導覽
-		const root = img.closest(CONTAINER_SELECTOR) ?? document.body;
+		const root = img.closest(CONTAINER_SELECTOR) ?? activeDocument.body;
 		const list = Array.from(root.querySelectorAll("img")).filter(
 			(el) => this.previewableImg(el) && el.getBoundingClientRect().width > 0
-		) as HTMLImageElement[];
+		);
 		const index = Math.max(0, list.indexOf(img));
 
 		this.overlay = new PeekOverlay(this, list.length ? list : [img], index);
@@ -282,7 +315,11 @@ export default class QuickPeekPlugin extends Plugin {
 			if (url.protocol === "app:") {
 				let p = decodeURIComponent(url.pathname);
 				if (/^\/[A-Za-z]:/.test(p)) p = p.slice(1); // Windows 磁碟機
-				const basePath = (this.app.vault.adapter as any).getBasePath?.();
+				const adapter = this.app.vault.adapter;
+				const basePath =
+					adapter instanceof FileSystemAdapter
+						? adapter.getBasePath()
+						: null;
 				if (basePath && p.startsWith(basePath)) {
 					const rel = p.slice(basePath.length).replace(/^[/\\]+/, "");
 					return {
@@ -302,9 +339,13 @@ export default class QuickPeekPlugin extends Plugin {
 	}
 
 	async loadSettings() {
-		const data = (await this.loadData()) ?? {};
+		const raw: unknown = await this.loadData();
+		const data: Partial<QuickPeekSettings> & { clickToOpen?: boolean } =
+			raw && typeof raw === "object"
+				? (raw as Partial<QuickPeekSettings> & { clickToOpen?: boolean })
+				: {};
 		// 從舊版設定遷移（clickToOpen → dblclickToOpen）
-		if ("clickToOpen" in data && !("dblclickToOpen" in data)) {
+		if (data.clickToOpen !== undefined && data.dblclickToOpen === undefined) {
 			data.dblclickToOpen = data.clickToOpen;
 			delete data.clickToOpen;
 		}
@@ -374,7 +415,7 @@ class PeekOverlay {
 		});
 		plugin.app.keymap.pushScope(this.keyScope);
 
-		const doc = document.body;
+		const doc = activeDocument.body;
 
 		this.rootEl = doc.createDiv({ cls: "image-peek-overlay" });
 		if (plugin.settings.backdropBlur) this.rootEl.addClass("qp-blur");
@@ -436,16 +477,17 @@ class PeekOverlay {
 		// 分享（macOS 桌面用系統分享選單；行動端用系統分享面板）
 		const canShareDesktop =
 			Platform.isDesktop && Platform.isMacOS && !!info.vaultPath;
-		const canShareMobile = Platform.isMobile && !!(navigator as any).share;
+		const canShareMobile =
+			Platform.isMobile && typeof navigator.share === "function";
 		if (canShareDesktop || canShareMobile) {
 			const shareBtn = this.actionsEl.createDiv({
 				cls: "qp-btn",
 				attr: { "aria-label": "Share" },
 			});
 			setIcon(shareBtn, "share");
-			shareBtn.addEventListener("click", () =>
-				this.shareImage(info, shareBtn)
-			);
+			shareBtn.addEventListener("click", () => {
+				void this.shareImage(info, shareBtn);
+			});
 		}
 
 		// 複製圖片（所有圖片皆可，含外部圖片）
@@ -454,20 +496,23 @@ class PeekOverlay {
 			attr: { "aria-label": "Copy image" },
 		});
 		setIcon(copyBtn, "copy");
-		copyBtn.addEventListener("click", () => this.copyImage());
+		copyBtn.addEventListener("click", () => {
+			void this.copyImage();
+		});
 
 		// 以下動作僅 vault 內圖片、桌面版
-		if (!info.vaultPath || !Platform.isDesktop) return;
+		const vaultPath = info.vaultPath;
+		if (!vaultPath || !Platform.isDesktop) return;
 
-		const app = this.plugin.app as any;
+		const app = this.plugin.app as AppWithDesktopInternals;
 		const openBtn = this.actionsEl.createDiv({
 			cls: "qp-btn",
 			attr: { "aria-label": "Open in default app" },
 		});
 		setIcon(openBtn, "external-link");
-		openBtn.addEventListener("click", () =>
-			app.openWithDefaultApp?.(info.vaultPath)
-		);
+		openBtn.addEventListener("click", () => {
+			app.openWithDefaultApp?.(vaultPath);
+		});
 
 		const revealBtn = this.actionsEl.createDiv({
 			cls: "qp-btn",
@@ -476,9 +521,9 @@ class PeekOverlay {
 			},
 		});
 		setIcon(revealBtn, "folder");
-		revealBtn.addEventListener("click", () =>
-			app.showInFolder?.(info.vaultPath)
-		);
+		revealBtn.addEventListener("click", () => {
+			app.showInFolder?.(vaultPath);
+		});
 	}
 
 	/** 叫出系統分享：macOS 桌面 → Apple 分享選單；行動端 → 系統分享面板 */
@@ -488,16 +533,25 @@ class PeekOverlay {
 			try {
 				if (!Platform.isMacOS || !info.vaultPath)
 					throw new Error("此平台不支援系統分享");
-				const electron = (window as any).require?.("electron");
+				const w = window as Window & {
+					require?: (module: string) => unknown;
+				};
+				const electron = w.require?.("electron") as
+					| { remote?: ElectronRemoteLike }
+					| undefined;
 				const remote =
 					electron?.remote ??
-					(window as any).require?.("@electron/remote");
+					(w.require?.("@electron/remote") as
+						| ElectronRemoteLike
+						| undefined);
 				const ShareMenu =
 					remote?.ShareMenu ?? remote?.require?.("electron")?.ShareMenu;
-				const basePath = (
-					this.plugin.app.vault.adapter as any
-				).getBasePath?.();
-				if (!ShareMenu || !basePath)
+				const adapter = this.plugin.app.vault.adapter;
+				const basePath =
+					adapter instanceof FileSystemAdapter
+						? adapter.getBasePath()
+						: null;
+				if (!ShareMenu || !basePath || !remote)
 					throw new Error("無法取得系統分享選單");
 
 				const absPath = `${basePath}/${info.vaultPath}`;
@@ -517,8 +571,7 @@ class PeekOverlay {
 
 		// --- 行動端：Web Share API（帶圖片檔） ---
 		try {
-			const resp = await fetch(this.imgEl.src);
-			const blob = await resp.blob();
+			const blob = await fetchImageBlob(this.imgEl.src);
 			const type = blob.type || "image/png";
 			const ext = (type.split("/")[1] ?? "png").replace("jpeg", "jpg");
 			const name = /\.[a-z0-9]+$/i.test(info.title)
@@ -526,16 +579,16 @@ class PeekOverlay {
 				: `${info.title || "image"}.${ext}`;
 			const file = new File([blob], name, { type });
 
-			const nav = navigator as any;
-			if (nav.canShare?.({ files: [file] })) {
-				await nav.share({ files: [file], title: info.title });
-			} else if (nav.share) {
-				await nav.share({ title: info.title, text: info.title });
+			const shareData: ShareData = { files: [file], title: info.title };
+			if (navigator.canShare?.(shareData)) {
+				await navigator.share(shareData);
+			} else if (typeof navigator.share === "function") {
+				await navigator.share({ title: info.title, text: info.title });
 			} else {
 				throw new Error("不支援 Web Share");
 			}
-		} catch (e: any) {
-			if (e?.name === "AbortError") return; // 使用者自己取消分享
+		} catch (e) {
+			if (e instanceof Error && e.name === "AbortError") return; // 使用者自己取消分享
 			console.error("Image Peek share failed", e);
 			new Notice("Could not share this image");
 		}
@@ -545,7 +598,7 @@ class PeekOverlay {
 	private async copyImage() {
 		const toPng = (source: CanvasImageSource, w: number, h: number) =>
 			new Promise<Blob>((res, rej) => {
-				const canvas = document.createElement("canvas");
+				const canvas = activeDocument.createElement("canvas");
 				canvas.width = w;
 				canvas.height = h;
 				canvas.getContext("2d")!.drawImage(source, 0, 0);
@@ -567,9 +620,10 @@ class PeekOverlay {
 					this.imgEl.naturalHeight
 				);
 			} catch {
-				// 跨網域圖片會污染 canvas：改用 fetch 取回再轉
-				const resp = await fetch(this.imgEl.src);
-				const bitmap = await createImageBitmap(await resp.blob());
+				// 跨網域圖片會污染 canvas：改抓原始資料再轉
+				const bitmap = await createImageBitmap(
+					await fetchImageBlob(this.imgEl.src)
+				);
 				blob = await toPng(bitmap, bitmap.width, bitmap.height);
 				bitmap.close();
 			}
@@ -592,6 +646,11 @@ class PeekOverlay {
 
 	/** FLIP：從來源縮圖的位置「長」到定位，模仿 Quick Look */
 	private animateIn(srcImg: HTMLImageElement) {
+		// 尊重系統「減少動態效果」設定：跳過 FLIP 動畫直接定位
+		if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+			this.rootEl.addClass("qp-open");
+			return;
+		}
 		this.rootEl.addClass("qp-entering");
 
 		const run = () => {
@@ -602,28 +661,34 @@ class PeekOverlay {
 				const sy = from.height / to.height;
 				const dx = from.left + from.width / 2 - (to.left + to.width / 2);
 				const dy = from.top + from.height / 2 - (to.top + to.height / 2);
-				this.imgEl.style.transform = `translate(${dx}px, ${dy}px) scale(${sx}, ${sy})`;
-				this.imgEl.style.opacity = "0.3";
+				this.imgEl.setCssStyles({
+					transform: `translate(${dx}px, ${dy}px) scale(${sx}, ${sy})`,
+					opacity: "0.3",
+				});
 			}
-			requestAnimationFrame(() => {
+			window.requestAnimationFrame(() => {
 				this.rootEl.removeClass("qp-entering");
 				this.rootEl.addClass("qp-open");
-				this.imgEl.style.transition =
-					"transform 240ms cubic-bezier(0.2, 0.8, 0.2, 1), opacity 200ms ease";
-				this.imgEl.style.transform = "";
-				this.imgEl.style.opacity = "1";
+				this.imgEl.setCssStyles({
+					transition:
+						"transform 240ms cubic-bezier(0.2, 0.8, 0.2, 1), opacity 200ms ease",
+					transform: "",
+					opacity: "1",
+				});
 				window.setTimeout(() => {
-					this.imgEl.style.transition = "";
+					this.imgEl.setCssStyles({ transition: "" });
 				}, 280);
 			});
 		};
 
 		if (this.imgEl.complete && this.imgEl.naturalWidth > 0) {
-			requestAnimationFrame(run);
+			window.requestAnimationFrame(run);
 		} else {
-			this.imgEl.addEventListener("load", () => requestAnimationFrame(run), {
-				once: true,
-			});
+			this.imgEl.addEventListener(
+				"load",
+				() => window.requestAnimationFrame(run),
+				{ once: true }
+			);
 			this.imgEl.addEventListener(
 				"error",
 				() => this.rootEl.addClass("qp-open"),
@@ -644,18 +709,23 @@ class PeekOverlay {
 		this.rootEl.removeClass("qp-open");
 		this.rootEl.addClass("qp-closing");
 
-		if (from && from.width > 0 && to.width > 0) {
+		const reduceMotion = window.matchMedia(
+			"(prefers-reduced-motion: reduce)"
+		).matches;
+		if (!reduceMotion && from && from.width > 0 && to.width > 0) {
 			const sx = from.width / to.width;
 			const sy = from.height / to.height;
 			const dx = from.left + from.width / 2 - (to.left + to.width / 2);
 			const dy = from.top + from.height / 2 - (to.top + to.height / 2);
-			this.imgEl.style.transition =
-				"transform 200ms cubic-bezier(0.4, 0, 0.6, 1), opacity 180ms ease";
-			this.imgEl.style.transform = `translate(${dx}px, ${dy}px) scale(${sx}, ${sy})`;
-			this.imgEl.style.opacity = "0";
+			this.imgEl.setCssStyles({
+				transition:
+					"transform 200ms cubic-bezier(0.4, 0, 0.6, 1), opacity 180ms ease",
+				transform: `translate(${dx}px, ${dy}px) scale(${sx}, ${sy})`,
+				opacity: "0",
+			});
 		}
 
-		window.setTimeout(() => this.destroy(), 210);
+		window.setTimeout(() => this.destroy(), reduceMotion ? 0 : 210);
 	}
 
 	destroy() {
@@ -794,10 +864,15 @@ class PeekOverlay {
 	}
 
 	private applyTransform(animated: boolean) {
-		this.imgEl.style.transition = animated ? "transform 180ms ease" : "";
-		this.imgEl.style.transform = `translate(${this.tx}px, ${this.ty}px) scale(${this.scale})`;
+		this.imgEl.setCssStyles({
+			transition: animated ? "transform 180ms ease" : "",
+			transform: `translate(${this.tx}px, ${this.ty}px) scale(${this.scale})`,
+		});
 		if (animated) {
-			window.setTimeout(() => (this.imgEl.style.transition = ""), 200);
+			window.setTimeout(
+				() => this.imgEl.setCssStyles({ transition: "" }),
+				200
+			);
 		}
 	}
 }

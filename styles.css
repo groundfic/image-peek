@@ -163,6 +163,6 @@
 	.image-peek-overlay .qp-backdrop,
 	.image-peek-overlay .qp-panel,
 	.image-peek-overlay .qp-img {
-		transition: none !important;
+		transition: none;
 	}
 }
