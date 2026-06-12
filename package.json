@@ -1,6 +1,6 @@
 {
   "name": "image-peek",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "description": "Quick Look-style image preview for Obsidian",
   "main": "main.js",
   "scripts": {

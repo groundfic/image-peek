@@ -4,7 +4,7 @@ Quick Look–style image preview for Obsidian — like pressing Space in Finder,
 
 The preview zooms out from the thumbnail's position (FLIP animation), supports pan/zoom, and closes right back into place.
 
-<img width="100%" alt="Kapture 2026-06-13 at 00 06 29" src="https://github.com/user-attachments/assets/ddf0e15b-ac9b-4437-9071-22c1e594cda8" />
+<!-- TODO: hero GIF here (open → zoom → close) -->
 
 ## Usage
 

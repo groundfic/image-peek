@@ -51,16 +51,53 @@ interface ElectronRemoteLike {
 	require?: (module: string) => { ShareMenu?: ShareMenuCtor } | undefined;
 }
 
-/** 取回圖片資料：http(s) 走 requestUrl（避開 CORS）；
- *  app:// 等本地協定 requestUrl 接不到，維持 fetch */
-async function fetchImageBlob(src: string): Promise<Blob> {
+const MIME_BY_EXT: Record<string, string> = {
+	png: "image/png",
+	jpg: "image/jpeg",
+	jpeg: "image/jpeg",
+	gif: "image/gif",
+	webp: "image/webp",
+	avif: "image/avif",
+	bmp: "image/bmp",
+	svg: "image/svg+xml",
+};
+
+function mimeFromPath(path: string): string {
+	const ext = path.split(".").pop()?.toLowerCase() ?? "";
+	return MIME_BY_EXT[ext] ?? "image/png";
+}
+
+/** 取回圖片資料，全程不使用 fetch：
+ *  vault 內檔案 → 官方 vault API 直接讀（桌面 app:// 與行動端 capacitor:// 皆適用）
+ *  外部 http(s) → requestUrl（避開 CORS）
+ *  data: URI → 手動解碼 */
+async function fetchImageBlob(
+	app: App,
+	src: string,
+	vaultPath: string | null
+): Promise<Blob> {
+	if (vaultPath) {
+		const data = await app.vault.adapter.readBinary(vaultPath);
+		return new Blob([data], { type: mimeFromPath(vaultPath) });
+	}
+	if (src.startsWith("data:")) {
+		const match = /^data:([^;,]+)?(;base64)?,(.*)$/.exec(src);
+		if (!match) throw new Error("Malformed data URI");
+		const type = match[1] || "image/png";
+		if (match[2]) {
+			const bin = atob(match[3]);
+			const bytes = new Uint8Array(bin.length);
+			for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+			return new Blob([bytes], { type });
+		}
+		return new Blob([decodeURIComponent(match[3])], { type });
+	}
 	if (src.startsWith("http")) {
 		const res = await requestUrl({ url: src });
 		const type = res.headers["content-type"]?.split(";")[0] ?? "image/png";
 		return new Blob([res.arrayBuffer], { type });
 	}
-	const resp = await fetch(src); // app:// 本地資源僅 fetch 可達
-	return resp.blob();
+	throw new Error("Unsupported image source");
 }
 
 const CONTAINER_SELECTOR =
@@ -384,6 +421,7 @@ class PeekOverlay {
 	private lastStageTap = 0;
 
 	private keyScope: Scope;
+	private currentInfo: ResolvedImage | null = null;
 
 	constructor(
 		private plugin: QuickPeekPlugin,
@@ -452,6 +490,7 @@ class PeekOverlay {
 		this.index = (index + this.list.length) % this.list.length;
 		const srcImg = this.list[this.index];
 		const info = this.plugin.resolveImage(srcImg);
+		this.currentInfo = info;
 
 		this.scale = 1;
 		this.tx = 0;
@@ -571,7 +610,11 @@ class PeekOverlay {
 
 		// --- 行動端：Web Share API（帶圖片檔） ---
 		try {
-			const blob = await fetchImageBlob(this.imgEl.src);
+			const blob = await fetchImageBlob(
+				this.plugin.app,
+				this.imgEl.src,
+				info.vaultPath
+			);
 			const type = blob.type || "image/png";
 			const ext = (type.split("/")[1] ?? "png").replace("jpeg", "jpg");
 			const name = /\.[a-z0-9]+$/i.test(info.title)
@@ -622,7 +665,11 @@ class PeekOverlay {
 			} catch {
 				// 跨網域圖片會污染 canvas：改抓原始資料再轉
 				const bitmap = await createImageBitmap(
-					await fetchImageBlob(this.imgEl.src)
+					await fetchImageBlob(
+						this.plugin.app,
+						this.imgEl.src,
+						this.currentInfo?.vaultPath ?? null
+					)
 				);
 				blob = await toPng(bitmap, bitmap.width, bitmap.height);
 				bitmap.close();
