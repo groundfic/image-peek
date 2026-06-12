@@ -1,0 +1,10 @@
+{
+  "id": "image-peek",
+  "name": "Image Peek",
+  "version": "0.5.1",
+  "minAppVersion": "1.5.0",
+  "description": "Quick Look–style image preview. Click an image or press Space to peek, like Finder and Freeform.",
+  "author": "Groundfic",
+  "isDesktopOnly": false,
+  "authorUrl": "https://github.com/groundfic"
+}

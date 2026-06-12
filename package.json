@@ -1,0 +1,15 @@
+{
+  "name": "image-peek",
+  "version": "0.5.1",
+  "description": "Quick Look-style image preview for Obsidian",
+  "main": "main.js",
+  "scripts": {
+    "dev": "esbuild src/main.ts --bundle --external:obsidian --format=cjs --outfile=main.js --target=es2020 --watch",
+    "build": "esbuild src/main.ts --bundle --external:obsidian --format=cjs --outfile=main.js --target=es2020 --minify-whitespace"
+  },
+  "devDependencies": {
+    "esbuild": "^0.21.0",
+    "obsidian": "latest",
+    "typescript": "^5.4.0"
+  }
+}
